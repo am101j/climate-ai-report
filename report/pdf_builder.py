@@ -1,65 +1,163 @@
 from fpdf import FPDF
 from io import BytesIO
+import logging
+import os
 
-def sanitize_text(text: str) -> str:
-    """Replace characters not supported by Latin-1."""
-    if not text:
-        return ""
-    replacements = {
-        "–": "-",   # en-dash
-        "—": "-",   # em-dash
-        "’": "'",   # curly apostrophe
-        "“": '"',
-        "”": '"',
-        "•": "-",   # bullet
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-    return text
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-def build_pdf(lat, lon, risk_score, flood_zone, wildfire_now, charts: dict, narrative: dict) -> BytesIO:
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
+# Colors
+COLOR_BLUE = (0, 102, 204)
+COLOR_DARK_GREEN = (0, 100, 0)
+COLOR_GREY = (128, 128, 128)
+
+
+class PDF(FPDF):
+    def header(self):
+        self.set_font("DejaVu", "B", 10)
+        self.set_text_color(*COLOR_GREY)
+        self.cell(0, 10, "ClimateLens – Climate & ESG Report", 0, 0, "C")
+        self.ln(15)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("DejaVu", "I", 8)
+        self.set_text_color(*COLOR_GREY)
+        self.cell(0, 10, f"Page {self.page_no()}", 0, 0, "C")
+
+
+def safe_multi_cell(pdf, text, w=0, h=8, align='J'):
+    """
+    Safely wrap text to avoid 'Not enough horizontal space' errors.
+    """
+    # Replace problematic unicode characters if needed
+    if text is None:
+        text = ""
+    # Replace non-breaking hyphen/dash variants with normal dash
+    text = text.replace("–", "-").replace("—", "-")
+    # Split very long words manually
+    words = text.split(" ")
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = f"{current_line} {word}".strip()
+        if pdf.get_string_width(test_line) > pdf.w - pdf.l_margin - pdf.r_margin:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+        else:
+            current_line = test_line
+    if current_line:
+        lines.append(current_line)
+    # Write each line
+    for line in lines:
+        pdf.multi_cell(w, h, line, align=align)
+        pdf.ln(0)
+
+
+def build_pdf(lat, lon, address, risk_score, flood_zone, charts: dict, narrative: dict) -> BytesIO:
+    logging.info("Starting PDF build process...")
+    pdf = PDF()
+    pdf.set_auto_page_break(auto=True, margin=25)
+
+    # --- Register fonts (assumes DejaVu fonts in the same folder) ---
+    pdf.add_font("DejaVu", "", "DejaVuSans.ttf", uni=True)
+    pdf.add_font("DejaVu", "B", "DejaVuSans-Bold.ttf", uni=True)
+    pdf.add_font("DejaVu", "I", "DejaVuSans-Oblique.ttf", uni=True)
+    pdf.add_font("DejaVu", "BI", "DejaVuSans-BoldOblique.ttf", uni=True)
+
     pdf.add_page()
 
-    # Use built-in font only
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, sanitize_text("ClimateLens – Climate & ESG Report"), ln=True, align="C")
+    # --- Title Page ---
+    pdf.set_font("DejaVu", "B", 36)
+    pdf.set_text_color(*COLOR_BLUE)
+    safe_multi_cell(pdf, "Climate & ESG Risk Report", h=12, align="C")
+    pdf.ln(10)
 
-    pdf.set_font("Arial", "", 12)
-    pdf.ln(4)
-    pdf.cell(0, 8, f"Location: ({lat:.5f}, {lon:.5f})", ln=True)
+    # Logo
+    logo_path = os.path.join(os.path.dirname(__file__), "ClimateLens Logo.png")
+    if os.path.exists(logo_path):
+        pdf.image(logo_path, x=85, w=40)
+    else:
+        logging.warning("Logo not found, using placeholder box.")
+        pdf.set_fill_color(230, 230, 230)
+        pdf.rect(x=85, y=pdf.get_y(), w=40, h=40, style="F")
+    pdf.ln(50)
 
-    # Key scores
-    scores = risk_score.get("scores", {})
-    pdf.cell(0, 8, f"Air Quality Risk (0-10): {scores.get('air_quality','N/A')}", ln=True)
-    pdf.cell(0, 8, f"Flood Risk (0 or 10): {scores.get('flood_risk','N/A')} (Flood Zone: {flood_zone.get('flood_zone')})", ln=True)
-    pdf.cell(0, 8, f"Wildfire Risk (0-10): {scores.get('wildfire_risk','N/A')}", ln=True)
+    # Property address
+    pdf.set_font("DejaVu", "", 14)
+    pdf.set_text_color(0, 0, 0)
+    safe_multi_cell(pdf, f"Property at: {address}", h=10, align="C")
+    pdf.ln(20)
 
-    # Charts
-    for label in ["risk_bar", "aq_gauges", "wildfire_ts", "heatwind_scen", "recent_daily"]:
-        if charts.get(label):
-            pdf.ln(5)
-            pdf.image(charts[label], w=180)
+    # --- Narrative Sections ---
+    section_order = ["executive_summary", "market_analysis", "climate_and_esg_risks", "final_verdict"]
+    chart_labels = {
+        "risk_bar": "Composite Climate Risk Scores",
+        "aq_gauges": "Air Quality Snapshot",
+        "wildfire_ts": "Wildfire Danger Trends",
+        "heatwind_scen": "Heat & Wind Climate Scenarios",
+        "recent_daily": "Recent Daily Weather",
+    }
 
-    # AI Sections
-    def write_section(title, body):
-        if not body:
-            return
+    for section_key in section_order:
+        section = narrative.get(section_key)
+        if not section:
+            continue
+
         pdf.add_page()
-        pdf.set_font("Arial", "B", 14)
-        pdf.cell(0, 10, sanitize_text(title), ln=True)
-        pdf.set_font("Arial", "", 12)
-        for line in sanitize_text(body).split("\n"):
-            pdf.multi_cell(0, 7, line)
+        # Section title
+        pdf.set_font("DejaVu", "B", 24)
+        pdf.set_text_color(*COLOR_BLUE)
+        safe_multi_cell(pdf, section.get("title", ""), h=10)
+        pdf.set_draw_color(*COLOR_BLUE)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(10)
 
-    write_section("1. Executive Summary", narrative.get("executive_summary") or narrative.get("raw"))
-    write_section("2. Local Climate Risk", narrative.get("local_climate_risk"))
-    write_section("3. Implications for Property Value & Insurability", narrative.get("implications"))
-    write_section("4. ESG & Resilience Opportunities", narrative.get("esg_opportunities"))
-    write_section("5. Final Verdict", narrative.get("verdict"))
+        for subsection in section.get("subsections", []):
+            # Subtitle
+            pdf.set_font("DejaVu", "B", 16)
+            pdf.set_text_color(*COLOR_DARK_GREEN)
+            safe_multi_cell(pdf, subsection.get("subtitle", ""), h=8)
+            pdf.ln(2)
 
-    pdf_bytes = pdf.output(dest="S").encode("latin1", errors="replace")
-    buf = BytesIO(pdf_bytes)
-    buf.seek(0)
-    return buf
+            # Paragraphs
+            pdf.set_font("DejaVu", "", 11)
+            pdf.set_text_color(0, 0, 0)
+            for p in subsection.get("paragraphs", []):
+                safe_multi_cell(pdf, p, h=6)
+                pdf.ln(1)
+
+            # Bullets
+            if subsection.get("bullets"):
+                for bullet in subsection.get("bullets", []):
+                    safe_multi_cell(pdf, f"  • {bullet}", h=6)
+                pdf.ln(2)
+
+            # Charts (avoid repeats)
+            if subsection.get("charts"):
+                used_charts = set()
+                for chart_ref in subsection.get("charts", []):
+                    if chart_ref in charts and chart_ref not in used_charts:
+                        used_charts.add(chart_ref)
+                        pdf.add_page()
+                        pdf.set_font("DejaVu", "B", 12)
+                        pdf.set_text_color(0, 0, 0)
+                        safe_multi_cell(pdf, chart_labels.get(chart_ref, "Chart"), h=8, align="C")
+                        page_width = pdf.w - pdf.l_margin - pdf.r_margin
+                        chart_width = min(180, page_width)
+                        x = (pdf.w - chart_width) / 2
+                        pdf.image(charts[chart_ref], x=x, w=chart_width)
+                        pdf.ln(5)
+
+    # --- Export PDF ---
+    logging.info("Encoding PDF to bytes...")
+    try:
+        pdf_bytes = pdf.output(dest="S")
+        buf = BytesIO(pdf_bytes)
+        buf.seek(0)
+        logging.info("PDF built successfully.")
+        return buf
+    except Exception as e:
+        logging.error(f"Failed to build PDF: {e}")
+        raise

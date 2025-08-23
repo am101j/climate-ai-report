@@ -1,117 +1,164 @@
 import logging
-import re
+import json
 import os
-from groq import Groq
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_MODEL = "llama-3.3-70b-versatile" 
+DEFAULT_MODEL = "gpt-5"
 
 SYSTEM_PROMPT = """
-You are a climate-risk and ESG analyst for residential properties.
-Write professional, and decision-useful text for homebuyers.
-However the report has to be positive, actually "selling" the property and not undermining the sale process.
-if there is something to be careful about the report should mention it, because we need to be frank and trustworthy - but minor things should not be inflated to scare a prospective buyer
-Use clear structure, medium sized paragraphs, bullets where relevant.
-Avoid jargon, use plain English.
-Highlight what matters for property value, insurance, and resilience.
-Offer actionable suggestions.
+You are a world-class climate-risk and ESG consultant producing reports for high-value residential properties.
+You should use plain language and NOT any links or reference URLs.
+STRICT SCHEMA (MUST FOLLOW EXACTLY):
+{
+  "executive_summary": {
+    "title": "Executive Summary",
+    "subsections": [
+      {
+        "subtitle": "Subsection Title",
+        "paragraphs": ["Paragraph text..."],  # 2–3 short paragraphs
+        "bullets": ["Bullet point..."],       # optional, 3–5 bullets
+        "charts": []
+      }
+    ]
+  },
+  "market_analysis": {
+    "title": "Market Analysis",
+    "subsections": [
+      {
+        "subtitle": "Subsection Title",
+        "paragraphs": ["Paragraph text..."],  # 2–3 short paragraphs
+        "bullets": ["Bullet point..."],       # optional, 3–5 bullets
+        "charts": ["wildfire_ts", "heatwind_scen"]
+      }
+    ]
+  },
+  "climate_and_esg_risks": {
+    "title": "Climate and ESG Risks",
+    "subsections": [
+      {
+        "subtitle": "Subsection Title",
+        "paragraphs": ["Paragraph text..."],  # 2–3 short paragraphs
+        "bullets": ["Bullet point..."],       # optional, 3–5 bullets
+        "charts": ["risk_bar", "aq_gauges", "recent_daily"]
+      }
+    ]
+  },
+  "final_verdict": {
+    "title": "Final Verdict",
+    "subsections": [
+      {
+        "subtitle": "Subsection Title",
+        "paragraphs": ["Paragraph text..."],
+        "bullets": ["Bullet point..."],
+        "charts": []
+      }
+    ]
+  }
+}
+
+For 'market_analysis', include:
+- Average property prices in the area
+- Typical rental/valuation trends
+- Liquidity, insurance, and resilience premiums
+Do NOT output URLs or any links. Use plain language.
+
+RULES:
+1. **MUST FOLLOW SCHEMA EXACTLY**.
+2. NO extra keys, fields, or URLs.
+3. Paragraphs: 2–3 short paragraphs per subsection.
+4. Bullets: optional, 3–5 bullets if present.
+5. Charts: choose from ["risk_bar","aq_gauges","wildfire_ts","heatwind_scen","recent_daily"] and no repeats.
+6. Output ONLY JSON. DO NOT add any explanation or text outside the JSON.
 """
 
-def _build_prompt(lat, lon, risk_score, aq_daily, aq_monthly, flood_zone, wildfire_now, wildfire_ts, heatwind_daily, heatwind_ts):
+AVAILABLE_CHARTS = ["risk_bar", "aq_gauges", "wildfire_ts", "heatwind_scen", "recent_daily"]
+
+def _build_prompt(lat, lon, address, risk_score, flood_zone, wildfire_now, **kwargs):
+    chart_info = []
+    for chart in AVAILABLE_CHARTS:
+        if kwargs.get(chart):
+            chart_info.append(f"- '{chart}': include if relevant")
+
+    chart_text = "Charts guidance:\n" + "\n".join(chart_info) if chart_info else ""
+
     return f"""
 {SYSTEM_PROMPT}
 
-Location: lat {lat}, lon {lon}
+Generate a report for the property at:
+Address: {address}
+Latitude: {lat}
+Longitude: {lon}
 
-Composite Risk Scores:
-- Air quality risk (0-10): {risk_score.get('scores', {}).get('air_quality')}
-- Flood risk (0/10): {risk_score.get('scores', {}).get('flood_risk')}
-- Wildfire risk (0-10): {risk_score.get('scores', {}).get('wildfire_risk')}
+Key Data:
+- Air Quality Risk: {risk_score.get("scores", {}).get("air_quality")}
+- Flood Risk: {risk_score.get("scores", {}).get("flood_risk")}
+- Wildfire Risk: {risk_score.get("scores", {}).get("wildfire_risk")}
+- Flood Zone: {flood_zone.get("flood_zone")}
+- Wildfire Risk (1km radius): {wildfire_now.get("properties", {}).get("fire_risk_class")}
 
-Flood Zone (current): {flood_zone.get('flood_zone')}
+{chart_text}
 
-Wildfire risk (current window, 1km radius):
-{wildfire_now}
-
-Wildfire timeseries (key fields per year):
-{list(wildfire_ts.keys())[:10]}
-
-Air quality daily (sample of last 5 rows):
-{str(aq_daily)[:800]}
-
-Air quality monthly (first 5 rows):
-{str(aq_monthly)[:800]}
-
-Heat/Wind daily (sample of last 5 rows):
-{str(heatwind_daily)[:800]}
-
-Heat/Wind scenarios (RCP45/85) – sample:
-{str(heatwind_ts)[:1200]}
-
-We want the report to be such that it postively impacts the buyer's decision, convincing them and selling it to them.
-Write these sections:
-1) Executive Summary – top 3 takeaways for a homebuyer (4–6 sentences)
-2) Local Climate Risk – contextualize scores in human terms
-3) Implications for Property Value & Insurability – 2–4 bullets
-4) ESG & Resilience Opportunities – practical retrofits, shading, green roofs, defensible space
-5) Final Verdict – 1 concise paragraph, actionable conclusion
+**CRITICAL:** Output must be a single valid JSON object strictly following the schema above, with no extra text, no URLs, and no deviations.
 """
 
 class AIWriter:
-    def __init__(self, groq_api_key: str = None):
-        self.client = Groq(api_key=groq_api_key or os.environ.get("GROQ_API_KEY"))
+    def __init__(self, openai_api_key: str = None):
+        self.client = OpenAI(api_key=openai_api_key or os.environ.get("OPENAI_API_KEY"))
 
-    def _call_groq(self, prompt: str, model: str = DEFAULT_MODEL, max_tokens: int = 650):
-        logging.info("Calling Groq API...")
+    def _call_openai(self, prompt: str) -> str:
+        logging.info("Calling GPT-5 API...")
         try:
-            completion = self.client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=max_tokens,
-                temperature=0.6,
+            response = self.client.responses.create(
+                model=DEFAULT_MODEL,
+                tools=[{"type": "web_search_preview"}],
+                input=prompt
             )
-            logging.info("Groq response received")
-            return completion.choices[0].message.content
-
+            output_text = response.output_text
+            logging.info("GPT-5 response received.")
+            return output_text
         except Exception as e:
-            logging.error(f"Groq API call failed: {e}")
+            logging.error(f"OpenAI API call failed: {e}")
             raise
 
-    def generate_sections(
-        self, lat, lon, risk_score, aq_daily, aq_monthly, flood_zone, wildfire_now, wildfire_ts, heatwind_daily, heatwind_ts
-    ) -> dict:
-        prompt = _build_prompt(
-            lat, lon, risk_score, aq_daily, aq_monthly, flood_zone,
-            wildfire_now, wildfire_ts, heatwind_daily, heatwind_ts
-        )
+    def generate_sections(self, lat, lon, address, risk_score, flood_zone, wildfire_now, **kwargs) -> dict:
+      prompt = _build_prompt(lat, lon, address, risk_score, flood_zone, wildfire_now, **kwargs)
+      raw_output = self._call_openai(prompt)
 
-        full = self._call_groq(prompt)
+      try:
+          parsed_json = json.loads(raw_output)
+          logging.info("GPT-5 JSON parsed successfully.")
+      except json.JSONDecodeError as e:
+          logging.error(f"Failed to parse JSON: {e}\nRaw output:\n{raw_output}")
+          raise ValueError("GPT-5 returned invalid JSON") from e
 
-        sections = {
-            "executive_summary": "",
-            "local_climate_risk": "",
-            "implications": "",
-            "esg_opportunities": "",
-            "verdict": "",
-            "raw": full
-        }
+      # Validate top-level sections and subsections
+      required_sections = ["executive_summary", "market_analysis", "climate_and_esg_risks", "final_verdict"]
+      for sec in required_sections:
+          if sec not in parsed_json:
+              raise ValueError(f"Missing required top-level section: {sec}")
+          if "title" not in parsed_json[sec] or "subsections" not in parsed_json[sec]:
+              raise ValueError(f"Section '{sec}' missing 'title' or 'subsections'")
 
-        text = full.strip()
+      # Deduplicate charts globally across all subsections
+      used_charts = set()
+      for sec in required_sections:
+          for sub in parsed_json[sec]["subsections"]:
+              if "subtitle" not in sub or "paragraphs" not in sub:
+                  raise ValueError(f"A subsection in '{sec}' is missing 'subtitle' or 'paragraphs'")
+              
+              if "charts" in sub:
+                  # Keep only allowed charts
+                  sub["charts"] = [c for c in sub["charts"] if c in AVAILABLE_CHARTS]
+                  # Keep charts not already used in other subsections
+                  new_charts = []
+                  for c in sub["charts"]:
+                      if c not in used_charts:
+                          new_charts.append(c)
+                          used_charts.add(c)
+                  sub["charts"] = new_charts
 
-        def extract(label):
-            pat = rf"{label}[:\n]+(.*?)(\n[1-9]\)|\n[A-Z][A-Za-z ]+?:|\Z)"
-            m = re.search(pat, text, flags=re.S|re.I)
-            return m.group(1).strip() if m else ""
+      logging.info("GPT-5 JSON validated successfully with unique charts across subsections.")
+      return parsed_json
 
-        sections["executive_summary"]    = extract("Executive Summary")
-        sections["local_climate_risk"]   = extract("Local Climate Risk")
-        sections["implications"]         = extract("Implications for Property Value & Insurability")
-        sections["esg_opportunities"]    = extract("ESG & Resilience Opportunities")
-        sections["verdict"]              = extract("Final Verdict")
-
-        logging.info("Sections generated successfully")
-        return sections
